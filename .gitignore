@@ -4,3 +4,4 @@ __pycache__/
 alerts.jsonl
 roi.txt
 counts.json
+*.md

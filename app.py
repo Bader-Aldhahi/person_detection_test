@@ -22,7 +22,7 @@ import numpy as np
 WINDOW_NAME = "Person ROI Monitor"
 PANEL_WIDTH = 340
 CLEAR_AFTER_SECONDS = 2.0
-DEFAULT_RTSP_URL = ""  # Set locally if needed; never commit camera credentials.
+DEFAULT_RTSP_URL = ""
 
 
 class LatestFrameCapture:
@@ -73,7 +73,6 @@ class LatestFrameCapture:
                 return
             self._stopped = True
             self._condition.notify_all()
-        # ponytail: FFmpeg's read timeout bounds shutdown; isolate capture in a process if a backend ignores it.
         self._thread.join(timeout=6.0)
 
 
@@ -178,7 +177,6 @@ def load_alerts(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     alerts: list[dict[str, Any]] = []
-    # ponytail: This demo scans JSONL once at startup; use indexed storage only if it grows large.
     for line in path.read_text(encoding="utf-8").splitlines():
         try:
             alert = json.loads(line)

@@ -62,7 +62,7 @@ def main() -> None:
     fake = FakeCapture()
     for value in (1, 2, 3):
         fake.frames.put(np.full((1, 1), value, dtype=np.uint8))
-    latest_capture = LatestFrameCapture(fake)  # type: ignore[arg-type]
+    latest_capture = LatestFrameCapture(fake)
     assert fake.waiting_for_fourth.wait(timeout=1.0)
     ok, newest = latest_capture.read()
     assert ok and newest is not None and newest.item() == 3

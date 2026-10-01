@@ -3,6 +3,8 @@
 import math
 import os
 import tempfile
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from queue import Queue
 from threading import Event
@@ -86,8 +88,11 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         alert_path = root / "alerts.jsonl"
-        append_alert(alert_path, {"id": "first"})
-        append_alert(alert_path, {"id": "second"})
+        terminal = StringIO()
+        with redirect_stdout(terminal):
+            append_alert(alert_path, {"id": "first"})
+            append_alert(alert_path, {"id": "second"})
+        assert terminal.getvalue() == alert_path.read_text(encoding="utf-8")
         assert [alert["id"] for alert in load_alerts(alert_path)] == ["first", "second"]
         with alert_path.open("a", encoding="utf-8") as handle:
             handle.write("{interrupted")

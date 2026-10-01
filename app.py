@@ -160,7 +160,7 @@ def load_roi(path: Path, width: int, height: int) -> list[tuple[int, int]] | Non
 
 
 def append_alert(path: Path, alert: dict[str, Any]) -> None:
-    """Append and flush one complete JSON object without using a database."""
+    """Save one JSON alert, then print the same event to the terminal."""
     path.parent.mkdir(parents=True, exist_ok=True)
     line = (json.dumps(alert, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
     with path.open("a+b") as handle:
@@ -171,6 +171,7 @@ def append_alert(path: Path, alert: dict[str, Any]) -> None:
         handle.write(line)
         handle.flush()
         os.fsync(handle.fileno())
+    print(line.decode("utf-8"), end="", flush=True)
 
 
 def load_alerts(path: Path) -> list[dict[str, Any]]:

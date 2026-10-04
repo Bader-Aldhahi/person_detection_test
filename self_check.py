@@ -3,12 +3,13 @@
 import math
 import os
 import tempfile
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from queue import Queue
 from threading import Event
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import app
 
@@ -46,6 +47,56 @@ class FakeCapture:
         self.release_calls += 1
         self.released.set()
         self.frames.put(None)
+
+
+def check_headless(root: Path) -> None:
+    roi_path = root / "headless-roi.txt"
+    alert_path = root / "headless-alerts.jsonl"
+    counts_path = root / "headless-counts.json"
+    frame = np.zeros((50, 100, 3), dtype=np.uint8)
+    save_roi(roi_path, [(0, 0), (99, 0), (99, 49), (0, 49)], 100, 50)
+    capture = Mock()
+    capture.read.side_effect = [(False, None), (True, frame)]
+    boxes = Mock()
+    boxes.xyxy.cpu().numpy.return_value = np.array([[10, 10, 30, 40]])
+    boxes.conf.cpu().numpy.return_value = np.array([0.9])
+    boxes.id.int().cpu().tolist.return_value = [7]
+    result = [SimpleNamespace(boxes=boxes)]
+    model = Mock()
+    model.track.side_effect = [result, result, KeyboardInterrupt]
+    terminal = StringIO()
+    with ExitStack() as stack:
+        stack.enter_context(redirect_stdout(terminal))
+        stack.enter_context(patch("sys.argv", [
+            "app.py", "--source", "0", "--roi-file", str(roi_path),
+            "--alerts-file", str(alert_path), "--counts-file", str(counts_path),
+        ]))
+        stack.enter_context(patch.dict("sys.modules", {"ultralytics": SimpleNamespace(YOLO=lambda _: model)}))
+        connect = stack.enter_context(patch.object(app, "connect_and_read", side_effect=[
+            (capture, frame), RuntimeError("temporary disconnection"), (capture, frame),
+        ]))
+        stack.enter_context(patch.object(app.time, "sleep"))
+        for name in ("namedWindow", "imshow", "waitKey", "getWindowProperty", "setMouseCallback", "destroyAllWindows"):
+            stack.enter_context(patch.object(app.cv2, name, side_effect=AssertionError("GUI called")))
+        assert app.main() == 0
+        assert connect.call_count == 3
+        assert capture.release.called
+        assert load_counts(counts_path) == (1, 0)
+        alerts = load_alerts(alert_path)
+        assert len(alerts) == 1 and alerts[0]["event"] == "person_in_roi"
+        assert alert_path.read_text(encoding="utf-8").strip() in terminal.getvalue()
+        assert all(call.kwargs["show"] is False for call in model.track.call_args_list)
+
+        connect.side_effect = None
+        connect.return_value = capture, frame
+        for content in (None, "[]"):
+            if content is None:
+                roi_path.unlink()
+            else:
+                roi_path.write_text(content, encoding="utf-8")
+            capture.release.reset_mock()
+            assert app.main() == 1
+            capture.release.assert_called_once()
 
 
 def main() -> None:
@@ -114,6 +165,7 @@ def main() -> None:
         counts_path = root / "counts.json"
         save_counts(counts_path, total, live)
         assert load_counts(counts_path) == (2, 0)
+        check_headless(root)
 
     print("Self-check passed")
 

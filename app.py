@@ -1,4 +1,4 @@
-"""Minimal RTSP person-in-ROI monitor with file-backed alerts."""
+"""Headless RTSP person-in-ROI monitor with file and terminal alerts."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import json
 import math
 import os
 import time
-from collections import deque
 from datetime import datetime
 from pathlib import Path
 from threading import Condition, Thread
@@ -19,8 +18,6 @@ import cv2
 import numpy as np
 
 
-WINDOW_NAME = "Person ROI Monitor"
-PANEL_WIDTH = 340
 CLEAR_AFTER_SECONDS = 2.0
 DEFAULT_RTSP_URL = ""
 
@@ -231,132 +228,6 @@ def update_entry_count(
     return total_count, len(inside_detections)
 
 
-def select_roi(
-    frame: np.ndarray,
-    capture: LatestFrameCapture | cv2.VideoCapture | None = None,
-    max_width: int = 960,
-) -> list[tuple[int, int]] | None:
-    """Let the user draw a polygon while the camera stays live."""
-    points: list[tuple[int, int]] = []
-    message = "LIVE - Left click: add | U: undo | C: clear | Enter/S: save | Q: quit"
-    height, width = frame.shape[:2]
-    live_frame = frame
-
-    def on_mouse(event: int, x: int, y: int, _flags: int, _data: Any) -> None:
-        nonlocal message
-        if event == cv2.EVENT_LBUTTONDOWN and 0 <= x < width and 0 <= y < height:
-            points.append((x, y))
-            message = "Add points, then press Enter or S to save"
-        elif event == cv2.EVENT_RBUTTONDOWN and points:
-            points.pop()
-            message = "Last point removed"
-
-    cv2.setMouseCallback(WINDOW_NAME, on_mouse)
-    try:
-        while True:
-            if capture is not None:
-                ok, next_frame = capture.read()
-                if ok and next_frame is not None:
-                    resized = resize_frame(next_frame, max_width)
-                    if resized.shape[:2] == (height, width):
-                        live_frame = resized
-            canvas = live_frame.copy()
-            if points:
-                polygon = np.asarray(points, dtype=np.int32)
-                cv2.polylines(canvas, [polygon], len(points) >= 3, (0, 255, 255), 2)
-                for point in points:
-                    cv2.circle(canvas, point, 5, (0, 255, 255), -1)
-
-            cv2.rectangle(canvas, (0, 0), (width, 36), (20, 20, 20), -1)
-            cv2.putText(
-                canvas,
-                message,
-                (10, 24),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.52,
-                (255, 255, 255),
-                1,
-                cv2.LINE_AA,
-            )
-            cv2.imshow(WINDOW_NAME, canvas)
-            key = cv2.waitKey(20) & 0xFF
-
-            if key in (ord("q"), 27):
-                return None
-            if key in (ord("c"),):
-                points.clear()
-                message = "ROI cleared; left click to start again"
-            elif key in (ord("u"), 8, 127) and points:
-                points.pop()
-                message = "Last point removed"
-            elif key in (ord("s"), 10, 13):
-                mask = make_roi_mask(live_frame.shape, points)
-                if len(set(points)) >= 3 and np.count_nonzero(mask) >= 10:
-                    return points.copy()
-                message = "Draw a valid area using at least 3 different points"
-
-            if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
-                return None
-    finally:
-        cv2.setMouseCallback(WINDOW_NAME, lambda *_args: None)
-
-
-def tint_roi(frame: np.ndarray, roi_mask: np.ndarray, active: bool) -> None:
-    overlay = frame.copy()
-    color = (30, 30, 230) if active else (20, 170, 20)
-    overlay[roi_mask.astype(bool)] = color
-    cv2.addWeighted(overlay, 0.18, frame, 0.82, 0, dst=frame)
-
-
-def draw_dashboard(
-    video: np.ndarray,
-    active: bool,
-    people_inside: int,
-    total_people: int,
-    total_alerts: int,
-    recent_alerts: deque[dict[str, Any]],
-    fps: float,
-    overlap_threshold: float,
-    message: str = "",
-) -> np.ndarray:
-    height = video.shape[0]
-    panel = np.full((height, PANEL_WIDTH, 3), 24, dtype=np.uint8)
-    y = 38
-
-    def add_line(text: str, color: tuple[int, int, int] = (220, 220, 220), scale: float = 0.55) -> None:
-        nonlocal y
-        cv2.putText(panel, text, (18, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)
-        y += 29
-
-    add_line("PERSON ROI MONITOR", (255, 255, 255), 0.68)
-    add_line("ALERT" if active else "CLEAR", (70, 70, 255) if active else (80, 220, 80), 0.8)
-    y += 5
-    add_line(f"Live count: {people_inside}")
-    add_line(f"Total count: {total_people}")
-    add_line(f"Saved alerts: {total_alerts}")
-    add_line(f"Overlap trigger: {overlap_threshold:.0%}")
-    add_line(f"Processing FPS: {fps:.1f}")
-    y += 12
-    add_line("RECENT ALERTS", (255, 255, 255), 0.58)
-
-    available_rows = max(0, (height - y - 85) // 27)
-    visible_alerts = list(recent_alerts)[-available_rows:][::-1] if available_rows else []
-    for alert in visible_alerts:
-        timestamp = str(alert.get("timestamp", ""))
-        clock = timestamp[11:19] if len(timestamp) >= 19 else timestamp[:8]
-        try:
-            confidence = float(alert.get("confidence", 0.0))
-            overlap = float(alert.get("overlap", 0.0))
-        except (TypeError, ValueError):
-            continue
-        add_line(f"{clock}  conf {confidence:.0%}  ROI {overlap:.0%}", (190, 190, 190), 0.46)
-
-    if message:
-        cv2.putText(panel, message[:38], (18, height - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80, 180, 255), 1)
-    cv2.putText(panel, "R: redraw ROI    Q: quit", (18, height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (180, 180, 180), 1)
-    return np.hstack((video, panel))
-
-
 def open_capture(source: str | int) -> cv2.VideoCapture:
     parameters: list[int] = []
     if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
@@ -387,25 +258,10 @@ def connect_and_read(source: str | int) -> tuple[LatestFrameCapture | cv2.VideoC
     return (LatestFrameCapture(capture) if is_live else capture), frame
 
 
-def reconnect_with_ui(
-    source: str | int,
-    dashboard: np.ndarray,
-) -> tuple[LatestFrameCapture | cv2.VideoCapture, np.ndarray] | None:
-    reconnecting = dashboard.copy()
-    cv2.putText(
-        reconnecting,
-        "Stream lost - reconnecting...",
-        (24, 48),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.8,
-        (0, 0, 255),
-        2,
-    )
+def reconnect(source: str | int) -> tuple[LatestFrameCapture | cv2.VideoCapture, np.ndarray]:
+    print("Stream lost - reconnecting. Press Ctrl+C to stop.", flush=True)
     while True:
-        cv2.imshow(WINDOW_NAME, reconnecting)
-        key = cv2.waitKey(1000) & 0xFF
-        if key in (ord("q"), 27) or cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
-            return None
+        time.sleep(1.0)
         try:
             return connect_and_read(source)
         except RuntimeError:
@@ -418,8 +274,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="yolo11m.pt", help="Ultralytics model path/name")
     parser.add_argument("--confidence", type=float, default=0.40, help="YOLO confidence threshold")
     parser.add_argument("--overlap", type=float, default=0.10, help="Minimum person-box area inside ROI")
-    parser.add_argument("--width", type=int, default=960, help="Maximum processing/display width")
-    parser.add_argument("--roi-file", type=Path, default=Path("roi.txt"))
+    parser.add_argument("--width", type=int, default=960, help="Maximum processing width")
+    parser.add_argument("--roi-file", type=Path, default=Path("roi.txt"), help="Required saved ROI polygon")
     parser.add_argument("--alerts-file", type=Path, default=Path("alerts.jsonl"))
     parser.add_argument("--counts-file", type=Path, default=Path("counts.json"))
     parser.add_argument("--device", help="Ultralytics device, for example 0 or cpu")
@@ -442,39 +298,23 @@ def main() -> int:
     source: str | int = int(source_text) if source_text.isdecimal() else source_text
 
     try:
-        setup_capture, raw_frame = connect_and_read(source)
+        capture, raw_frame = connect_and_read(source)
     except RuntimeError as error:
         print(f"Error: {error}. Check the URL, camera, and network.")
         return 1
-    frame = resize_frame(raw_frame, args.width)
-    height, width = frame.shape[:2]
-    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
-
     try:
+        frame = resize_frame(raw_frame, args.width)
+        height, width = frame.shape[:2]
         try:
             roi_points = load_roi(args.roi_file, width, height)
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-            print(f"Ignoring invalid {args.roi_file}: {error}. Please redraw it.")
-            roi_points = None
-
+            print(f"Error: invalid ROI file {args.roi_file}: {error}")
+            return 1
         if roi_points is None or np.count_nonzero(make_roi_mask(frame.shape, roi_points)) < 10:
-            roi_points = select_roi(frame, setup_capture, args.width)
-            if roi_points is None:
-                setup_capture.release()
-                return 0
-            try:
-                save_roi(args.roi_file, roi_points, width, height)
-            except (OSError, ValueError) as error:
-                setup_capture.release()
-                print(f"Error: ROI could not be saved to {args.roi_file}: {error}")
-                return 1
-
-        setup_capture.release()
+            print(f"Error: provide a valid saved ROI polygon with --roi-file (current: {args.roi_file}).")
+            return 1
         roi_mask = make_roi_mask(frame.shape, roi_points)
-        loading = frame.copy()
-        cv2.putText(loading, "Loading YOLO11m...", (24, 48), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
-        cv2.imshow(WINDOW_NAME, loading)
-        cv2.waitKey(1)
+        print(f"Loading {args.model}...", flush=True)
 
         try:
             from ultralytics import YOLO
@@ -484,9 +324,6 @@ def main() -> int:
             print(f"Error loading {args.model}: {error}")
             return 1
 
-        all_alerts = load_alerts(args.alerts_file)
-        recent_alerts: deque[dict[str, Any]] = deque(all_alerts[-8:], maxlen=8)
-        total_alerts = len(all_alerts)
         try:
             total_people, _ = load_counts(args.counts_file)
             save_counts(args.counts_file, total_people, 0)
@@ -494,32 +331,24 @@ def main() -> int:
             print(f"Error: counts could not be loaded or saved at {args.counts_file}: {error}")
             return 1
 
-        try:
-            capture, raw_frame = connect_and_read(source)
-        except RuntimeError as error:
-            print(f"Error: {error} after setup.")
-            return 1
-
         occupied = False
         last_inside_at = 0.0
         tracked_inside: dict[int, float] = {}
         last_saved_counts = (total_people, 0)
-        smoothed_fps = 0.0
-        dashboard_message = ""
+        print(f"Monitoring ROI. Alerts: {args.alerts_file}. Press Ctrl+C to stop.", flush=True)
 
         try:
             while True:
-                started_at = time.perf_counter()
                 frame = resize_frame(raw_frame, args.width)
                 if frame.shape[:2] != roi_mask.shape:
                     try:
                         roi_points = load_roi(args.roi_file, frame.shape[1], frame.shape[0])
                     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
                         print(f"ROI no longer matches the stream: {error}")
-                        break
+                        return 1
                     if roi_points is None:
                         print("ROI file disappeared; stopping rather than monitoring without an ROI.")
-                        break
+                        return 1
                     roi_mask = make_roi_mask(frame.shape, roi_points)
 
                 predict_options: dict[str, Any] = {
@@ -527,6 +356,7 @@ def main() -> int:
                     "classes": [0],
                     "conf": args.confidence,
                     "verbose": False,
+                    "show": False,
                 }
                 if args.device:
                     predict_options["device"] = args.device
@@ -571,7 +401,7 @@ def main() -> int:
                         save_counts(args.counts_file, total_people, live_people)
                     except OSError as error:
                         print(f"Fatal: counts could not be saved to {args.counts_file}: {error}")
-                        break
+                        return 1
                     last_saved_counts = total_people, live_people
 
                 if inside_now:
@@ -592,86 +422,24 @@ def main() -> int:
                             append_alert(args.alerts_file, alert)
                         except OSError as error:
                             print(f"Fatal: alert could not be saved to {args.alerts_file}: {error}")
-                            break
-                        recent_alerts.append(alert)
-                        total_alerts += 1
+                            return 1
                         occupied = True
-                        dashboard_message = "New alert saved"
                 elif occupied and now - last_inside_at >= CLEAR_AFTER_SECONDS:
                     occupied = False
-                    dashboard_message = "ROI re-armed"
-
-                annotated = frame.copy()
-                tint_roi(annotated, roi_mask, inside_now)
-                polygon = np.asarray(roi_points, dtype=np.int32)
-                cv2.polylines(annotated, [polygon], True, (0, 0, 255) if inside_now else (0, 255, 0), 2)
-                for detection in detections:
-                    x1, y1, x2, y2 = (round(float(value)) for value in detection["box"])
-                    color = (0, 0, 255) if detection["inside"] else (0, 210, 255)
-                    cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-                    label = f"person {detection['confidence']:.0%} | ROI {detection['overlap']:.0%}"
-                    cv2.putText(
-                        annotated,
-                        label,
-                        (max(0, x1), max(18, y1 - 7)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        color,
-                        2,
-                        cv2.LINE_AA,
-                    )
-
-                elapsed = max(time.perf_counter() - started_at, 1e-9)
-                instant_fps = 1.0 / elapsed
-                smoothed_fps = instant_fps if smoothed_fps == 0.0 else 0.9 * smoothed_fps + 0.1 * instant_fps
-                dashboard = draw_dashboard(
-                    annotated,
-                    inside_now,
-                    live_people,
-                    total_people,
-                    total_alerts,
-                    recent_alerts,
-                    smoothed_fps,
-                    args.overlap,
-                    dashboard_message,
-                )
-                cv2.imshow(WINDOW_NAME, dashboard)
-                key = cv2.waitKey(1) & 0xFF
-                dashboard_message = ""
-                if key in (ord("q"), 27):
-                    break
-                if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
-                    break
-                if key == ord("r"):
-                    new_points = select_roi(frame, capture, args.width)
-                    if new_points is None:
-                        break
-                    try:
-                        save_roi(args.roi_file, new_points, frame.shape[1], frame.shape[0])
-                    except (OSError, ValueError) as error:
-                        print(f"Fatal: ROI could not be saved to {args.roi_file}: {error}")
-                        break
-                    roi_points = new_points
-                    roi_mask = make_roi_mask(frame.shape, roi_points)
-                    occupied = False
-                    tracked_inside.clear()
-                    dashboard_message = "New ROI saved"
 
                 ok, raw_frame = capture.read()
                 if not ok or raw_frame is None:
                     capture.release()
-                    reconnected = reconnect_with_ui(source, dashboard)
-                    if reconnected is None:
-                        break
-                    capture, raw_frame = reconnected
+                    capture, raw_frame = reconnect(source)
+        except KeyboardInterrupt:
+            print("\nMonitoring stopped.", flush=True)
         finally:
-            capture.release()
-        try:
-            save_counts(args.counts_file, total_people, 0)
-        except OSError as error:
-            print(f"Warning: final live count could not be cleared: {error}")
+            try:
+                save_counts(args.counts_file, total_people, 0)
+            except OSError as error:
+                print(f"Warning: final live count could not be cleared: {error}")
     finally:
-        cv2.destroyAllWindows()
+        capture.release()
     return 0
 
 

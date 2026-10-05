@@ -1,4 +1,4 @@
-"""Multiple resident YOLO models on a simulated fixed-FPS image stream.
+"""Multiple resident YOLO models on a simulated fixed-FPS FIFO image stream.
 
 Examples: python gpu_load.py --copies 4
           python gpu_load.py --models yolo11n.pt yolo11m.pt
@@ -12,28 +12,27 @@ import time
 from pathlib import Path
 
 
-def latest_slot(next_slot, elapsed, fps, total):
-    # ponytail: repeated-image arrivals, not real camera losses; use a capture producer for live tests.
-    return min(total, max(next_slot, int(elapsed * fps)))
+def queued_frames(processed, elapsed, fps, total):
+    # ponytail: identical images need only an arrival count, not stored copies.
+    # A live camera needs a real frame queue; this simulates fixed-rate arrivals only.
+    arrived = min(total, int(max(0, elapsed) * fps) + 1)
+    return max(0, arrived - processed)
 
 
 def self_test():
-    assert latest_slot(0, 0, 10, 100) == 0
-    assert latest_slot(1, 0.05, 10, 100) == 1
-    assert latest_slot(1, 0.35, 10, 100) == 3  # slots 1 and 2 skipped
-    assert latest_slot(4, 0.4, 10, 100) == 4
-    assert latest_slot(4, 20, 10, 100) == 100
-    next_slot = processed = skipped = 0
-    for elapsed in (0, 0.35, 0.6, 2):
-        slot = latest_slot(next_slot, elapsed, 10, 10)
-        skipped += slot - next_slot
-        next_slot = slot
-        if slot < 10:
-            processed += 1
-            next_slot += 1
-        assert processed + skipped == next_slot
-    assert processed + skipped == 10
-    print("PASS: frame scheduling, skipped counter, and final accounting")
+    assert queued_frames(0, 0, 10, 10) == 1
+    assert queued_frames(1, 0.05, 10, 10) == 0
+    assert queued_frames(1, 0.35, 10, 10) == 3
+    elapsed = 0
+    backlogs = []
+    for slot in range(10):
+        elapsed = max(elapsed, slot / 10) + 0.25  # slower than arrivals
+        backlogs.append(queued_frames(slot + 1, elapsed, 10, 10))
+    assert backlogs[0] == 2
+    assert max(backlogs) > 2
+    assert backlogs[-1] == 0  # drains after the last arrival, without dropping
+    assert queued_frames(10, 20, 10, 10) == 0
+    print("PASS: FIFO backlog grows under load and drains after all frames finish")
 
 
 def main():
@@ -42,7 +41,7 @@ def main():
     parser.add_argument("--models", nargs="+", type=Path, default=[folder / "yolo11m.pt"])
     parser.add_argument("--copies", type=int, help="Copies of each model (default: 2 for one model, otherwise 1)")
     parser.add_argument("--image", type=Path, default=folder / "images.jpg")
-    parser.add_argument("--frames", type=int, default=1000, help="Total simulated arriving frames, including skips")
+    parser.add_argument("--frames", type=int, default=1000, help="Total frames to process in order")
     parser.add_argument("--fps", type=float, default=30)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--device", type=int, default=0)
@@ -72,11 +71,11 @@ def main():
         parser.error(f"Cannot decode image: {args.image}")
     options = dict(device=args.device, imgsz=args.imgsz, classes=[0], verbose=False, save=False, show=False)
     models = []
-    processed = skipped = next_slot = 0
+    processed = 0
     total_ms = 0.0
     print(f"GPU: {torch.cuda.get_device_name(args.device)} | Models: {len(args.models) * copies} | "
           f"Simulated FPS: {args.fps:g} | Arrivals: {args.frames}", flush=True)
-    print("Sequential models per image; skips include processing and reporting delays. Ctrl+C stops.", flush=True)
+    print("FIFO: every frame runs through all models; backlog grows when processing falls behind. Ctrl+C stops.", flush=True)
     try:
         for path in args.models:
             for copy in range(copies):
@@ -87,42 +86,41 @@ def main():
         torch.cuda.synchronize(args.device)
         print("Warm-up complete; starting measurements.", flush=True)
         start = time.perf_counter()
-        while next_slot < args.frames:
-            delay = start + next_slot / args.fps - time.perf_counter()
+        for slot in range(args.frames):
+            arrival = start + slot / args.fps
+            delay = arrival - time.perf_counter()
             if delay > 0:
                 time.sleep(delay)
-            slot = latest_slot(next_slot, time.perf_counter() - start, args.fps, args.frames)
-            skipped += slot - next_slot
-            next_slot = slot
-            if slot == args.frames:
-                break
             torch.cuda.synchronize(args.device)
             begin = time.perf_counter()
+            wait_ms = max(0, begin - arrival) * 1000
             timings = []
             for label, model in models:
                 result = model.predict(image, **options)[0]
                 timings.append(f"{label}: {result.speed['inference']:.1f} ms")
                 del result
             torch.cuda.synchronize(args.device)
-            duration = (time.perf_counter() - begin) * 1000
+            end = time.perf_counter()
+            duration = (end - begin) * 1000
             processed += 1
-            next_slot += 1
             total_ms += duration
+            queued = queued_frames(processed, end - start, args.fps, args.frames)
             free, total = torch.cuda.mem_get_info(args.device)
             used = total - free
             reserved = torch.cuda.memory_reserved(args.device) / 2**20
             print(f"Frame {slot + 1}/{args.frames} | {' | '.join(timings)} | "
                   f"Processing: {duration:.1f} ms | Avg: {total_ms / processed:.1f} ms | "
                   f"VRAM device: {used / 2**20:.0f}/{total / 2**20:.0f} MiB ({used / total:.1%}) | "
-                  f"PyTorch reserved: {reserved:.0f} MiB | Processed: {processed} | Skipped: {skipped}", flush=True)
+                  f"PyTorch reserved: {reserved:.0f} MiB | Processed: {processed} | "
+                  f"Queued: {queued} | Queue wait: {wait_ms:.1f} ms", flush=True)
     except KeyboardInterrupt:
         print("\nStopped.", flush=True)
     except torch.cuda.OutOfMemoryError:
-        raise SystemExit("GPU out of memory: reduce --copies or --imgsz. Test stopped; OOM is not counted as a skipped arrival.")
+        raise SystemExit("GPU out of memory: reduce --copies or --imgsz. Test stopped with unfinished frames.")
     finally:
         average = f"{total_ms / processed:.1f} ms" if processed else "N/A"
-        print(f"SUMMARY | Processed: {processed} | Skipped: {skipped} | "
-              f"Unfinished/not reached: {args.frames - processed - skipped} | Avg processing: {average}", flush=True)
+        print(f"SUMMARY | Processed: {processed} | "
+              f"Unfinished/not reached: {args.frames - processed} | Avg processing: {average}", flush=True)
 
 
 if __name__ == "__main__":
